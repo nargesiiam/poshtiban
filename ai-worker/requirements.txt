@@ -1,0 +1,10 @@
+openai==1.55.3
+langgraph==0.2.60
+langchain-core==0.3.25
+chromadb==0.5.23
+psycopg[binary]==3.2.3
+pika==1.3.2
+requests==2.32.3
+langfuse==2.57.0
+python-decouple==3.8
+pypdf==5.1.0

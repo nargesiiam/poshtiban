@@ -1,0 +1,170 @@
+name: relay
+
+services:
+  # ------------------------------------------------------------------
+  # پایگاه‌داده رابطه‌ای — منبع حقیقتِ داده‌ی ساخت‌یافته (سفارش‌ها، کاربران، پیام‌ها، رویدادها)
+  # ------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: relay-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-relay}
+      POSTGRES_USER: ${POSTGRES_USER:-relay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relay}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-relay} -d ${POSTGRES_DB:-relay}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - relay-net
+
+  # ------------------------------------------------------------------
+  # صف پیام — عصب کشیِ ارتباط بین backend و ai-worker
+  # ------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: relay-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-relay}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-relay}
+    ports:
+      - "5672:5672"   # پروتکل AMQP — برای اتصال backend و worker
+      - "15672:15672" # پنل مدیریتی وب — برای دیدن صف‌ها هنگام دیباگ و دمو
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - relay-net
+
+  # ------------------------------------------------------------------
+  # پایگاه‌داده برداری — برای RAG روی اسناد بارگذاری‌شده
+  # ------------------------------------------------------------------
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: relay-chromadb
+    volumes:
+      - chromadb_data:/chroma/chroma
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('localhost', 8000), 2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    networks:
+      - relay-net
+
+  # ------------------------------------------------------------------
+  # لایه‌ی وب — Django روی ASGI (برای پشتیبانی از SSE هم‌زمان با REST معمولی)
+  # ------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+    container_name: relay-backend
+    command: >
+      sh -c "python manage.py migrate &&
+             daphne -b 0.0.0.0 -p 8000 config.asgi:application"
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8080:8000"
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings
+      - POSTGRES_HOST=postgres          # نام سرویس، نه localhost — توضیح در بخش پایین
+      - POSTGRES_DB=${POSTGRES_DB:-relay}
+      - POSTGRES_USER=${POSTGRES_USER:-relay}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-relay}
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=${RABBITMQ_USER:-relay}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-relay}
+      - CHROMADB_HOST=chromadb
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - relay-net
+
+  # ------------------------------------------------------------------
+  # لایه‌ی اجرای هوش مصنوعی — فرایند کاملاً جدا از وب
+  # عامل LangGraph اینجا اجرا می‌شود، نه داخل چرخه‌ی درخواست Django
+  # ------------------------------------------------------------------
+  ai-worker:
+    build:
+      context: ./ai-worker
+    container_name: relay-ai-worker
+    command: python -m app.consumer
+    volumes:
+      - ./ai-worker:/app
+      # اسناد را backend می‌نویسد (media/)، ai-worker فقط می‌خواند —
+      # همان bind mount روی مسیر مطلق یکسان (/app/media) در هر دو کانتینر
+      - ./backend/media:/app/media:ro
+      # مدل embedding پیش‌فرض (~۸۰ مگابایت) این‌جا کش می‌شود — بدون این
+      # volume، هر docker compose up --build دوباره از صفر دانلودش می‌کند
+      - embedding_cache:/root/.cache/chroma
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB:-relay}
+      - POSTGRES_USER=${POSTGRES_USER:-relay}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-relay}
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=${RABBITMQ_USER:-relay}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-relay}
+      - CHROMADB_HOST=chromadb
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-chat}
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    networks:
+      - relay-net
+
+  # ------------------------------------------------------------------
+  # رابط کاربری — React
+  # ------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    container_name: relay-frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5174:5173"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8080
+    depends_on:
+      - backend
+    networks:
+      - relay-net
+
+networks:
+  relay-net:
+    driver: bridge
+
+# volumeهای نام‌دار — داده باید زنده بماند حتی اگر کانتینر پاک و دوباره ساخته شود
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  chromadb_data:
+  embedding_cache:
